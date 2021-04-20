@@ -41,6 +41,7 @@
 #include <linux/compiler.h>
 #include <linux/gfp.h>
 #include <linux/module.h>
+#include <net/cls_cgroup.h>
 
 /* People can turn this off for buggy TCP's found in printers etc. */
 int sysctl_tcp_retrans_collapse __read_mostly = 1;
@@ -292,6 +293,11 @@ static u16 tcp_select_window(struct sock *sk)
 		new_win = min(new_win, MAX_TCP_WINDOW);
 	else
 		new_win = min(new_win, (65535U << tp->rx_opt.rcv_wscale));
+
+	if (sysctl_net_isolation_enable)
+		new_win = cls_cgroup_adjust_wnd(sk, new_win,
+			    inet_csk(sk)->icsk_ack.rcv_mss,
+			    tp->rx_opt.rcv_wscale);
 
 	/* RFC1323 scaling applied */
 	new_win >>= tp->rx_opt.rcv_wscale;

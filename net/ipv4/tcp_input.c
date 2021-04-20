@@ -76,6 +76,7 @@
 #include <linux/ipsec.h>
 #include <asm/unaligned.h>
 #include <linux/errqueue.h>
+#include <net/cls_cgroup.h>
 
 int sysctl_tcp_fack __read_mostly;
 int sysctl_tcp_max_reordering __read_mostly = 300;
@@ -604,6 +605,8 @@ void tcp_rcv_space_adjust(struct sock *sk)
 	struct tcp_sock *tp = tcp_sk(sk);
 	u32 copied;
 	int time;
+	bool is_low = sysctl_net_isolation_enable ? is_low_prio(sk) : 0;
+	int scale = cls_cgroup_factor(sk);
 
 	tcp_mstamp_refresh(tp);
 	time = tcp_stamp_us_delta(tp->tcp_mstamp, tp->rcvq_space.time);
@@ -632,7 +635,10 @@ void tcp_rcv_space_adjust(struct sock *sk)
 		/* minimal window to cope with packet losses, assuming
 		 * steady state. Add some cushion because of small variations.
 		 */
-		rcvwin = ((u64)copied << 1) + 16 * tp->advmss;
+		if (is_low)
+			rcvwin = ((u64)copied * (WND_DIVISOR + scale)) >> WND_DIV_SHIFT;
+		else
+			rcvwin = ((u64)copied << 1) + 16 * tp->advmss;
 
 		/* If rate increased by 25%,
 		 *	assume slow start, rcvwin = 3 * copied

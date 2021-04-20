@@ -16,11 +16,13 @@
 
 #include <net/cls_cgroup.h>
 #include <net/sock.h>
+#include <linux/errno.h>
+#include <linux/string.h>
+#include "tx_cgroup.h"
+#include "rx_cgroup.h"
 
-static inline struct cgroup_cls_state *css_cls_state(struct cgroup_subsys_state *css)
-{
-	return css ? container_of(css, struct cgroup_cls_state, css) : NULL;
-}
+char tc_dev_name[IFNAMSIZ];
+struct net_device  *tc_dev;
 
 struct cgroup_cls_state *task_cls_state(struct task_struct *p)
 {
@@ -28,6 +30,42 @@ struct cgroup_cls_state *task_cls_state(struct task_struct *p)
 					    rcu_read_lock_bh_held()));
 }
 EXPORT_SYMBOL_GPL(task_cls_state);
+
+int cls_cgroup_stats_init(struct cls_cgroup_stats *stats)
+{
+	struct {
+		struct nlattr nla;
+		struct gnet_estimator params;
+	} opt;
+	int err;
+
+	opt.nla.nla_len = nla_attr_size(sizeof(opt.params));
+	opt.nla.nla_type = TCA_RATE;
+	opt.params.interval = 0; /* statistics every 1s. */
+	opt.params.ewma_log = 0; /* ewma off. */
+	spin_lock_init(&stats->lock);
+
+	rtnl_lock();
+	err = gen_new_estimator(&stats->bstats,
+				NULL,
+				&stats->est,
+				&stats->lock,
+				NULL,
+				&opt.nla);
+
+	if (err)
+		pr_err("gen_new_estimator failed(%d)\n", err);
+	rtnl_unlock();
+
+	return err;
+}
+
+void cls_cgroup_stats_destroy(struct cls_cgroup_stats *stats)
+{
+	rtnl_lock();
+	gen_kill_estimator(&stats->est);
+	rtnl_unlock();
+}
 
 static struct cgroup_subsys_state *
 cgrp_css_alloc(struct cgroup_subsys_state *parent_css)
@@ -46,10 +84,27 @@ static int cgrp_css_online(struct cgroup_subsys_state *css)
 	struct cgroup_cls_state *cs = css_cls_state(css);
 	struct cgroup_cls_state *parent = css_cls_state(css->parent);
 
-	if (parent)
-		cs->classid = parent->classid;
+	if (!parent) {
+		rx_cgroup_tb_init(css);
+		tx_cgroup_tb_init(css);
+	}
 
+	if (parent) {
+		cs->prio = parent->prio;
+		cs->classid = parent->classid;
+	}
+
+	cls_cgroup_stats_init(&cs->rx_stats);
+	cls_cgroup_stats_init(&cs->tx_stats);
 	return 0;
+}
+
+static void cgrp_css_offline(struct cgroup_subsys_state *css)
+{
+	struct cgroup_cls_state *cs = css_cls_state(css);
+
+	cls_cgroup_stats_destroy(&cs->rx_stats);
+	cls_cgroup_stats_destroy(&cs->tx_stats);
 }
 
 static void cgrp_css_free(struct cgroup_subsys_state *css)
@@ -132,21 +187,56 @@ static int write_classid(struct cgroup_subsys_state *css, struct cftype *cft,
 	return 0;
 }
 
-static u64 read_tc_prio(struct cgroup_subsys_state *css,
-			struct cftype *cft)
+static u64 read_class_prio(struct cgroup_subsys_state *css, struct cftype *cft)
 {
-	struct cgroup_cls_state *cs = css_cls_state(css);
-
-	return cs->tc_prio;
+	return css_cls_state(css)->prio;
 }
 
-static int write_tc_prio(struct cgroup_subsys_state *css,
-			 struct cftype *cft,
-			 u64 val)
+static int write_class_prio(struct cgroup_subsys_state *css, struct cftype *cft,
+			 u64 value)
 {
-	struct cgroup_cls_state *cs = css_cls_state(css);
+	if (value >= CLS_TC_PRIO_MAX)
+		return -EINVAL;
 
-	cs->tc_prio = (u32)val;
+	css_cls_state(css)->prio = (u32) value;
+
+	return 0;
+}
+
+static ssize_t write_dev_name(struct kernfs_open_file *of,
+			    char *buf, size_t nbytes, loff_t off)
+{
+	struct net_device *dev;
+	struct net *net = current->nsproxy->net_ns;
+
+	buf = strim(buf);
+	if (!strcmp(tc_dev_name, buf))
+		return nbytes;
+
+	dev = dev_get_by_name(net, buf);
+	if (!dev) {
+		pr_err("Netdev name %s not found!\n", buf);
+		return -ENODEV;
+	}
+	strncpy(tc_dev_name, buf, IFNAMSIZ);
+	tc_dev = dev;
+	dev_put(dev);
+
+	return nbytes;
+}
+
+static int read_dev_name(struct seq_file *sf, void *v)
+{
+	seq_printf(sf, "%s\n", tc_dev_name);
+	return 0;
+}
+
+int read_class_stat(struct seq_file *sf, void *v)
+{
+	struct cgroup_subsys_state *css = seq_css(sf);
+
+	read_tx_stat(css, sf);
+	read_rx_stat(css, sf);
 	return 0;
 }
 
@@ -157,9 +247,54 @@ static struct cftype ss_files[] = {
 		.write_u64	= write_classid,
 	},
 	{
-		.name		= "tc_prio",
-		.read_u64	= read_tc_prio,
-		.write_u64	= write_tc_prio,
+		.name		= "dev_name",
+		.flags		= CFTYPE_ONLY_ON_ROOT,
+		.seq_show	= read_dev_name,
+		.write		= write_dev_name,
+	},
+	{
+		.name		= "tx_bw_min",
+		.flags		= CFTYPE_ONLY_ON_ROOT,
+		.read_u64	= read_tx_bw_min,
+		.write_u64	= write_tx_bw_min,
+	},
+	{
+		.name		= "tx_bw_max",
+		.flags		= CFTYPE_ONLY_ON_ROOT,
+		.read_u64	= read_tx_bw_max,
+		.write_u64	= write_tx_bw_max,
+	},
+	{
+		.name		= "rx_bw_max",
+		.flags		= CFTYPE_ONLY_ON_ROOT,
+		.read_u64	= read_rx_bw_max,
+		.write_u64	= write_rx_bw_max,
+	},
+	{
+		.name		= "rx_bw_min",
+		.flags		= CFTYPE_ONLY_ON_ROOT,
+		.read_u64	= read_rx_bw_min,
+		.write_u64	= write_rx_bw_min,
+	},
+	{
+		.name		= "rx_min_rwnd_segs",
+		.flags		= CFTYPE_ONLY_ON_ROOT,
+		.read_u64	= read_rx_min_rwnd_segs,
+		.write_u64	= write_rx_min_rwnd_segs,
+	},
+	{
+		.name		= "stat",
+		.seq_show	= read_class_stat,
+	},
+	{
+		.name		= "prio",
+		.read_u64	= read_class_prio,
+		.write_u64	= write_class_prio,
+	},
+	{
+		.name		= "dump",
+		.flags		= CFTYPE_ONLY_ON_ROOT,
+		.seq_show	= read_sys_tb,
 	},
 	{ }	/* terminate */
 };
@@ -167,7 +302,16 @@ static struct cftype ss_files[] = {
 struct cgroup_subsys net_cls_cgrp_subsys = {
 	.css_alloc		= cgrp_css_alloc,
 	.css_online		= cgrp_css_online,
+	.css_offline		= cgrp_css_offline,
 	.css_free		= cgrp_css_free,
 	.attach			= cgrp_attach,
 	.legacy_cftypes		= ss_files,
 };
+
+static int __init net_isolate_setup(char *str)
+{
+	sysctl_net_isolation_enable = 1;
+	return 1;
+}
+__setup("net_isolate", net_isolate_setup);
+

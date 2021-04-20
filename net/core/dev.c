@@ -4357,6 +4357,8 @@ static int __netif_receive_skb_core(struct sk_buff *skb, bool pfmemalloc)
 	trace_netif_receive_skb(skb);
 
 	orig_dev = skb->dev;
+	if (!skb->in_dev)
+		skb->in_dev = orig_dev;
 
 	skb_reset_network_header(skb);
 	if (!skb_transport_header_was_set(skb))

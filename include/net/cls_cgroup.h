@@ -18,8 +18,16 @@
 #include <linux/rcupdate.h>
 #include <net/sock.h>
 #include <net/inet_sock.h>
+#include <linux/gen_stats.h>
+#include <linux/pkt_sched.h>
 
 #ifdef CONFIG_CGROUP_NET_CLASSID
+
+#define NET_MSCALE          (1000 * 1000)
+#define RATE_UNLIMITED      0
+#define TOKEN_CHARGE_TIKES  16
+#define WND_DIV_SHIFT       10
+#define WND_DIVISOR         (1 << WND_DIV_SHIFT)
 
 enum {
 	CLS_TC_RX,
@@ -28,16 +36,30 @@ enum {
 };
 
 enum {
-	CLS_TC_PRIO_NORMAL,
 	CLS_TC_PRIO_HIGH,
+	CLS_TC_PRIO_NORMAL,
 	CLS_TC_PRIO_MAX
+};
+
+struct cls_cgroup_stats {
+	struct gnet_stats_basic_packed bstats;
+	struct net_rate_estimator __rcu *est;
+	spinlock_t lock;
+	atomic64_t dropped;
 };
 
 struct cgroup_cls_state {
 	struct cgroup_subsys_state css;
+	struct cls_cgroup_stats rx_stats;
+	struct cls_cgroup_stats tx_stats;
 	u32 classid;
-	u32 tc_prio;
+	u32 prio;
 };
+
+static inline struct cgroup_cls_state *css_cls_state(struct cgroup_subsys_state *css)
+{
+	return css ? container_of(css, struct cgroup_cls_state, css) : NULL;
+}
 
 struct cgroup_cls_state *task_cls_state(struct task_struct *p);
 
@@ -90,6 +112,31 @@ static inline u32 task_get_classid(const struct sk_buff *skb)
 
 	return classid;
 }
+
+static inline s64 ns_to_bytes(u64 rate, s64 diff)
+{
+	return rate * (u64)diff / NSEC_PER_SEC;
+}
+
+static inline s64 bytes_to_ns(u64 rate, u64 bytes)
+{
+	if (unlikely(!rate))
+		return 0;
+
+	return bytes * NSEC_PER_SEC / rate;
+}
+
+extern inline struct cgroup_cls_state *cgrp_cls_state(struct cgroup *cgrp);
+extern void sock_update_classid(struct sock_cgroup_data *skcd);
+extern bool cls_cgroup_rx_accept(struct sock *sk, struct sk_buff *skb);
+extern bool cls_cgroup_tx_accept(struct sock *sk, struct sk_buff *skb);
+extern u32 cls_cgroup_adjust_wnd(struct sock *sk, u32 wnd, u32 mss, u16 wscale);
+extern int cls_cgroup_factor(const struct sock *sk);
+extern bool is_low_prio(struct sock *sk);
+extern char tc_dev_name[IFNAMSIZ];
+extern struct net_device *tc_dev;
+extern int sysctl_net_isolation_enable;
+
 #else /* !CONFIG_CGROUP_NET_CLASSID */
 static inline void sock_update_classid(struct sock_cgroup_data *skcd)
 {
