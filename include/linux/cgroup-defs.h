@@ -694,6 +694,7 @@ struct sock_cgroup_data {
 #endif
 		u64		val;
 	};
+	void			*cs;
 };
 
 /*

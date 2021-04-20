@@ -57,18 +57,40 @@ static void cgrp_css_free(struct cgroup_subsys_state *css)
 	kfree(css_cls_state(css));
 }
 
+struct update_classid_context {
+	u32 classid;
+	struct task_struct *task;
+};
+
 static int update_classid_sock(const void *v, struct file *file, unsigned n)
 {
 	int err;
+	struct update_classid_context *ctx = (void *)v;
 	struct socket *sock = sock_from_file(file, &err);
 
 	if (sock) {
 		spin_lock(&cgroup_sk_update_lock);
-		sock_cgroup_set_classid(&sock->sk->sk_cgrp_data,
-					(unsigned long)v);
+		sock_cgroup_set_classid(&sock->sk->sk_cgrp_data, ctx->classid);
+		sock->sk->sk_cgrp_data.cs = task_cls_state(ctx->task);
 		spin_unlock(&cgroup_sk_update_lock);
 	}
 	return 0;
+}
+
+static void update_classid_task(struct task_struct *p, u32 classid)
+{
+	struct update_classid_context ctx = {
+		.classid = classid,
+		.task = p
+	};
+	unsigned int fd = 0;
+
+	do {
+		task_lock(p);
+		fd = iterate_fd(p->files, fd, update_classid_sock, &ctx);
+		task_unlock(p);
+		cond_resched();
+	} while (fd);
 }
 
 static void cgrp_attach(struct cgroup_taskset *tset)
@@ -77,10 +99,7 @@ static void cgrp_attach(struct cgroup_taskset *tset)
 	struct task_struct *p;
 
 	cgroup_taskset_for_each(p, css, tset) {
-		task_lock(p);
-		iterate_fd(p->files, 0, update_classid_sock,
-			   (void *)(unsigned long)css_cls_state(css)->classid);
-		task_unlock(p);
+		update_classid_task(p, css_cls_state(css)->classid);
 	}
 }
 
@@ -113,11 +132,34 @@ static int write_classid(struct cgroup_subsys_state *css, struct cftype *cft,
 	return 0;
 }
 
+static u64 read_tc_prio(struct cgroup_subsys_state *css,
+			struct cftype *cft)
+{
+	struct cgroup_cls_state *cs = css_cls_state(css);
+
+	return cs->tc_prio;
+}
+
+static int write_tc_prio(struct cgroup_subsys_state *css,
+			 struct cftype *cft,
+			 u64 val)
+{
+	struct cgroup_cls_state *cs = css_cls_state(css);
+
+	cs->tc_prio = (u32)val;
+	return 0;
+}
+
 static struct cftype ss_files[] = {
 	{
 		.name		= "classid",
 		.read_u64	= read_classid,
 		.write_u64	= write_classid,
+	},
+	{
+		.name		= "tc_prio",
+		.read_u64	= read_tc_prio,
+		.write_u64	= write_tc_prio,
 	},
 	{ }	/* terminate */
 };

@@ -20,9 +20,23 @@
 #include <net/inet_sock.h>
 
 #ifdef CONFIG_CGROUP_NET_CLASSID
+
+enum {
+	CLS_TC_RX,
+	CLS_TC_TX,
+	CLS_TC_DIRECTION_MAX
+};
+
+enum {
+	CLS_TC_PRIO_NORMAL,
+	CLS_TC_PRIO_HIGH,
+	CLS_TC_PRIO_MAX
+};
+
 struct cgroup_cls_state {
 	struct cgroup_subsys_state css;
 	u32 classid;
+	u32 tc_prio;
 };
 
 struct cgroup_cls_state *task_cls_state(struct task_struct *p);
@@ -48,6 +62,7 @@ static inline void sock_update_classid(struct sock_cgroup_data *skcd)
 
 	classid = task_cls_classid(current);
 	sock_cgroup_set_classid(skcd, classid);
+	skcd->cs = task_cls_state(current);
 }
 
 static inline u32 task_get_classid(const struct sk_buff *skb)
